@@ -257,8 +257,16 @@ async def get_live_signals():
         "realized_gains": {}
     }
     
+    # Handle intervals - they might already be Interval objects
+    intervals = []
+    for i in current_settings.signals.intervals:
+        if isinstance(i, Interval):
+            intervals.append(i)
+        else:
+            intervals.append(Interval.from_string(i))
+    
     agent = Agent(
-        intervals=[Interval.from_string(i) for i in current_settings.signals.intervals],
+        intervals=intervals,
         strategies=current_settings.signals.strategies,
         show_agent_graph=False,
     )
