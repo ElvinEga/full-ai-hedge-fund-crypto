@@ -1,12 +1,13 @@
 import os
 import sys
 import yaml
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+import json
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
 from typing import List, Dict, Any
-import json
+from sqlalchemy.orm import Session
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
@@ -14,6 +15,7 @@ from src.backtest.backtester import Backtester
 from src.agent.agent import Agent
 from src.utils.settings import settings as current_settings
 from src.utils.constants import Interval
+from src.database import get_db, BacktestRun
 
 app = FastAPI(title="AI Hedge Fund Crypto API")
 
@@ -94,10 +96,29 @@ async def run_backtest(params: BacktestParams):
 @app.websocket("/ws/backtest")
 async def websocket_backtest(websocket: WebSocket):
     await websocket.accept()
+    db = None
+    run_record = None
+    
     try:
         params_json = await websocket.receive_text()
         params_dict = json.loads(params_json)
         params = BacktestParams(**params_dict)
+
+        # Create database session and record
+        db = next(get_db())
+        run_record = BacktestRun(
+            start_date=params.start_date,
+            end_date=params.end_date,
+            initial_capital=params.initial_cash,
+            parameters=json.dumps({
+                "tickers": params.tickers,
+                "intervals": params.intervals,
+                "strategies": params.strategies
+            })
+        )
+        db.add(run_record)
+        db.commit()
+        db.refresh(run_record)
 
         backtester = Backtester(
             primary_interval=Interval.from_string(params.intervals[0]),
@@ -114,17 +135,67 @@ async def websocket_backtest(websocket: WebSocket):
             show_reasoning=False
         )
         
+        final_metrics = None
+        portfolio_history = None
+        
         for update in backtester.run_backtest_stream():
             await websocket.send_json(update)
+            if update["type"] == "final_metrics":
+                final_metrics = update["data"]
+            elif update["type"] == "portfolio_history":
+                portfolio_history = update["data"]
         
-        await websocket.send_json({"type": "complete"})
+        # Update database record with final results
+        if portfolio_history and len(portfolio_history) > 0:
+            final_value = portfolio_history[-1].get("Portfolio Value", params.initial_cash)
+            run_record.final_portfolio_value = final_value
+            run_record.total_return_pct = ((final_value / params.initial_cash) - 1) * 100
+        
+        if final_metrics:
+            run_record.sharpe_ratio = final_metrics.get("sharpe_ratio")
+            run_record.sortino_ratio = final_metrics.get("sortino_ratio")
+            run_record.max_drawdown = final_metrics.get("max_drawdown")
+        
+        if portfolio_history:
+            run_record.portfolio_history = json.dumps(portfolio_history)
+        
+        db.commit()
+        
+        await websocket.send_json({"type": "complete", "run_id": run_record.id})
 
     except WebSocketDisconnect:
         print("WebSocket disconnected")
     except Exception as e:
         await websocket.send_json({"type": "error", "message": str(e)})
     finally:
+        if db:
+            db.close()
         await websocket.close()
+
+@app.get("/api/backtests")
+async def list_backtests(db: Session = Depends(get_db)):
+    runs = db.query(BacktestRun).order_by(BacktestRun.id.desc()).limit(50).all()
+    return runs
+
+@app.get("/api/backtests/{run_id}")
+async def get_backtest_details(run_id: int, db: Session = Depends(get_db)):
+    run = db.query(BacktestRun).filter(BacktestRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Backtest not found.")
+    
+    return {
+        "id": run.id,
+        "start_date": run.start_date,
+        "end_date": run.end_date,
+        "initial_capital": run.initial_capital,
+        "final_portfolio_value": run.final_portfolio_value,
+        "total_return_pct": run.total_return_pct,
+        "sharpe_ratio": run.sharpe_ratio,
+        "sortino_ratio": run.sortino_ratio,
+        "max_drawdown": run.max_drawdown,
+        "parameters": json.loads(run.parameters) if run.parameters else {},
+        "portfolio_history": json.loads(run.portfolio_history) if run.portfolio_history else []
+    }
 
 @app.get("/api/live-signals")
 async def get_live_signals():
