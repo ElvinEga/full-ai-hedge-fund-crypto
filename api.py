@@ -1,5 +1,6 @@
 import os
 import sys
+import yaml
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -36,6 +37,28 @@ class BacktestParams(BaseModel):
 @app.get("/")
 def read_root():
     return {"message": "AI Hedge Fund Crypto API is running."}
+
+@app.get("/api/settings")
+async def get_settings():
+    """Reads and returns the current config.yaml settings."""
+    try:
+        with open("config.yaml", "r") as f:
+            settings_data = yaml.safe_load(f)
+        return settings_data
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="config.yaml not found.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading config: {str(e)}")
+
+@app.post("/api/settings")
+async def update_settings(new_settings: Dict[str, Any]):
+    """Receives new settings and updates config.yaml."""
+    try:
+        with open("config.yaml", "w") as f:
+            yaml.dump(new_settings, f, default_flow_style=False, sort_keys=False)
+        return {"message": "Settings updated successfully. Please restart the backend server for changes to take effect."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error writing config: {str(e)}")
 
 @app.post("/api/backtest")
 async def run_backtest(params: BacktestParams):
