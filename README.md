@@ -126,6 +126,9 @@ This architecture provides several advantages:
 - [Usage](#usage)
   - [Running Backtest Mode](#running-backtest-mode)
   - [Running Live Mode](#running-live-mode)
+- [Web Interface](#web-interface)
+  - [Quick Start](#quick-start)
+  - [Features](#web-features)
 - [Creating Custom Strategies](#creating-custom-strategies)
 - [Project Structure](#project-structure)
 - [Contributing](#contributing)
@@ -338,6 +341,55 @@ Sample output:
 ```
 
 > **IMPORTANT**: Live trading involves real financial risk. Start with small amounts and thoroughly test your strategies in backtesting mode before deploying with real capital.
+
+## Web Interface
+
+A modern web interface is available for running backtests and viewing live signals through your browser.
+
+### Quick Start
+
+The easiest way to run both the backend API and frontend together:
+
+```bash
+./start.sh
+```
+
+This will start:
+- Python FastAPI backend on `http://localhost:8000`
+- Next.js frontend on `http://localhost:3000`
+- API documentation at `http://localhost:8000/docs`
+
+Alternatively, run them separately in two terminals:
+
+**Terminal 1 - Backend:**
+```bash
+source .venv/bin/activate
+uvicorn api:app --reload --port 8000
+```
+
+**Terminal 2 - Frontend:**
+```bash
+cd frontend
+bun run dev
+```
+
+### Web Features
+
+The web interface provides:
+
+- **Backtest Dashboard** (`/backtest`): Interactive form to configure and run backtests with real-time results visualization
+- **Live Signals** (`/live`): View current trading signals with AI reasoning and confidence levels
+- **Performance Charts**: Interactive charts showing portfolio value over time using Recharts
+- **Responsive Design**: Works on desktop and mobile devices
+
+The frontend is built with:
+- Next.js 16 with TypeScript
+- Shadcn UI components
+- Tailwind CSS for styling
+- Axios for API communication
+- Recharts for data visualization
+
+For more details, see the [frontend README](frontend/README.md).
 
 ## Creating Custom Strategies
 
