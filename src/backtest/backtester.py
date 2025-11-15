@@ -459,6 +459,109 @@ class Backtester:
         self.performance_metrics = performance_metrics
         return performance_metrics
 
+    def run_backtest_stream(self):
+        """Streaming version of run_backtest that yields progress updates."""
+        self.prefetch_data()
+
+        lengths = []
+        for ticker in self.tickers:
+            df = self.klines.get(ticker)
+            if not isinstance(df, pd.DataFrame):
+                raise TypeError(f"Data for {ticker} is not a DataFrame: {type(df)}")
+            lengths.append(len(df))
+
+        if len(set(lengths)) != 1:
+            raise ValueError(f"DataFrames have mismatched lengths: {dict(zip(self.tickers, lengths))}")
+
+        ticker = self.tickers[0]
+        data_df: pd.DataFrame = self.klines[ticker]
+        performance_metrics = {"sharpe_ratio": None, "sortino_ratio": None, "max_drawdown": None,
+                               "long_short_ratio": None, "gross_exposure": None, "net_exposure": None}
+
+        if len(data_df) > 0:
+            self.portfolio_values = [{"Date": data_df.loc[0, 'open_time'], "Portfolio Value": self.initial_capital}]
+        else:
+            self.portfolio_values = []
+
+        agent = Agent(
+            intervals=self.intervals,
+            strategies=self.strategies,
+            show_agent_graph=False,
+        )
+
+        for row in data_df.itertuples(index=True):
+            index = row.Index
+            current_time = row.close_time
+            current_prices = {}
+            for ticker in self.tickers:
+                price_data = self.klines[ticker]
+                current_prices[ticker] = price_data.iloc[index]["close"]
+
+            output = agent.run(
+                primary_interval=self.primary_interval,
+                tickers=self.tickers,
+                end_date=current_time,
+                portfolio=self.portfolio,
+                model_name=self.model_name,
+                model_provider=self.model_provider,
+                model_base_url=self.model_base_url,
+                show_reasoning=False,
+            )
+
+            decisions = output.get("decisions")
+            analyst_signals = output["analyst_signals"]
+
+            executed_trades = {}
+            for ticker in self.tickers:
+                decision = decisions.get(ticker, {"action": "hold", "quantity": 0.0})
+                action, quantity = decision.get("action", "hold"), decision.get("quantity", 0.0)
+                executed_quantity = self.execute_trade(ticker, action, quantity, current_prices[ticker])
+                executed_trades[ticker] = executed_quantity
+
+            total_value = self.calculate_portfolio_value(current_prices)
+            long_exposure = sum(self.portfolio["positions"][t]["long"] * current_prices[t] for t in self.tickers)
+            short_exposure = sum(self.portfolio["positions"][t]["short"] * current_prices[t] for t in self.tickers)
+            gross_exposure = long_exposure + short_exposure
+            net_exposure = long_exposure - short_exposure
+
+            self.portfolio_values.append({
+                "Date": current_time,
+                "Portfolio Value": total_value,
+                "Long Exposure": long_exposure,
+                "Short Exposure": short_exposure,
+                "Gross Exposure": gross_exposure,
+                "Net Exposure": net_exposure
+            })
+
+            # Yield progress for each ticker
+            for ticker in self.tickers:
+                pos = self.portfolio["positions"][ticker]
+                action = decisions.get(ticker, {}).get("action", "hold")
+                quantity = executed_trades.get(ticker, 0.0)
+                
+                yield {
+                    "type": "progress",
+                    "data": {
+                        "date": str(current_time),
+                        "ticker": ticker,
+                        "action": action,
+                        "quantity": float(quantity),
+                        "price": float(current_prices[ticker]),
+                        "position": float(pos["long"] - pos["short"]),
+                        "portfolio_value": float(total_value)
+                    }
+                }
+
+            if len(self.portfolio_values) > 3:
+                self._update_performance_metrics(performance_metrics)
+
+        self.performance_metrics = performance_metrics
+        yield {"type": "final_metrics", "data": performance_metrics}
+
+        performance_df = self.analyze_performance()
+        portfolio_history = performance_df.reset_index().to_dict(orient='records')
+        yield {"type": "portfolio_history", "data": portfolio_history}
+
     def _update_performance_metrics(self, performance_metrics):
         """Helper method to update performance metrics using daily returns."""
         values_df = pd.DataFrame(self.portfolio_values).set_index("Date")
