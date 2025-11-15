@@ -40,6 +40,15 @@ class BacktestParams(BaseModel):
 def read_root():
     return {"message": "AI Hedge Fund Crypto API is running."}
 
+@app.get("/api/health")
+def health_check():
+    """Health check endpoint for deployment monitoring"""
+    return {
+        "status": "healthy",
+        "service": "AI Hedge Fund Crypto API",
+        "version": "1.0.0"
+    }
+
 @app.get("/api/settings")
 async def get_settings():
     """Reads and returns the current config.yaml settings."""
