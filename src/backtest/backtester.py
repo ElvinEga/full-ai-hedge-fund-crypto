@@ -562,6 +562,24 @@ class Backtester:
             if len(self.portfolio_values) > 3:
                 self._update_performance_metrics(performance_metrics)
 
+            # Yield live summary update
+            portfolio_return = (total_value / self.initial_capital - 1) * 100
+            total_position_value = total_value - self.portfolio["cash"]
+            
+            yield {
+                "type": "summary_update",
+                "data": {
+                    "date": current_time.isoformat(),
+                    "cash_balance": float(self.portfolio["cash"]),
+                    "total_position_value": float(total_position_value),
+                    "total_value": float(total_value),
+                    "return_pct": float(portfolio_return),
+                    "sharpe_ratio": performance_metrics.get("sharpe_ratio"),
+                    "sortino_ratio": performance_metrics.get("sortino_ratio"),
+                    "max_drawdown": performance_metrics.get("max_drawdown"),
+                }
+            }
+
         self.performance_metrics = performance_metrics
         yield {"type": "final_metrics", "data": performance_metrics}
 

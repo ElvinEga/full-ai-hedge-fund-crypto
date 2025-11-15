@@ -2,6 +2,7 @@ import os
 import sys
 import yaml
 import json
+import asyncio
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -105,121 +106,145 @@ async def run_backtest(params: BacktestParams):
 @app.websocket("/ws/backtest")
 async def websocket_backtest(websocket: WebSocket):
     await websocket.accept()
-    db = None
-    run_record = None
     
     try:
         params_json = await websocket.receive_text()
         params_dict = json.loads(params_json)
         params = BacktestParams(**params_dict)
 
-        # Create database session and record
-        db = next(get_db())
-        run_record = BacktestRun(
-            start_date=params.start_date,
-            end_date=params.end_date,
-            initial_capital=params.initial_cash,
-            parameters=json.dumps({
-                "tickers": params.tickers,
-                "intervals": params.intervals,
-                "strategies": params.strategies
-            })
-        )
-        db.add(run_record)
-        db.commit()
-        db.refresh(run_record)
-
-        # Run main ensemble backtest with streaming
-        backtester = Backtester(
-            primary_interval=Interval.from_string(params.intervals[0]),
-            intervals=[Interval.from_string(i) for i in params.intervals],
-            tickers=params.tickers,
-            start_date=params.start_date,
-            end_date=params.end_date,
-            initial_capital=params.initial_cash,
-            strategies=params.strategies,
-            model_name=current_settings.model.name,
-            model_provider=current_settings.model.provider,
-            model_base_url=current_settings.model.base_url,
-            show_agent_graph=False,
-            show_reasoning=False
-        )
+        # Run backtest in executor to avoid blocking
+        loop = asyncio.get_event_loop()
         
-        final_metrics = None
-        portfolio_history = None
-        
-        for update in backtester.run_backtest_stream():
-            await websocket.send_json(update)
-            if update["type"] == "final_metrics":
-                final_metrics = update["data"]
-            elif update["type"] == "portfolio_history":
-                portfolio_history = update["data"]
-        
-        # Update database record with final results
-        if portfolio_history and len(portfolio_history) > 0:
-            final_value = portfolio_history[-1].get("Portfolio Value", params.initial_cash)
-            run_record.final_portfolio_value = final_value
-            run_record.total_return_pct = ((final_value / params.initial_cash) - 1) * 100
-        
-        if final_metrics:
-            run_record.sharpe_ratio = final_metrics.get("sharpe_ratio")
-            run_record.sortino_ratio = final_metrics.get("sortino_ratio")
-            run_record.max_drawdown = final_metrics.get("max_drawdown")
-        
-        if portfolio_history:
-            run_record.portfolio_history = json.dumps(portfolio_history)
-        
-        db.commit()
-
-        # Run individual strategy backtests for comparison
-        if len(params.strategies) > 1:
-            import pandas as pd
-            all_histories = []
+        async def run_backtest_async():
+            db = next(get_db())
+            run_record = None
             
-            # Add ensemble results
-            ensemble_df = pd.DataFrame(portfolio_history).set_index("Date")
-            ensemble_df = ensemble_df[["Portfolio Value"]].rename(columns={"Portfolio Value": "Ensemble"})
-            all_histories.append(ensemble_df)
-            
-            # Run each strategy individually
-            for strategy in params.strategies:
-                await websocket.send_json({"type": "status", "message": f"Running {strategy}..."})
-                
-                strategy_backtester = Backtester(
-                    primary_interval=Interval.from_string(params.intervals[0]),
-                    intervals=[Interval.from_string(i) for i in params.intervals],
-                    tickers=params.tickers,
+            try:
+                # Create database record
+                run_record = BacktestRun(
                     start_date=params.start_date,
                     end_date=params.end_date,
                     initial_capital=params.initial_cash,
-                    strategies=[strategy],
-                    model_name=current_settings.model.name,
-                    model_provider=current_settings.model.provider,
-                    model_base_url=current_settings.model.base_url,
-                    show_agent_graph=False,
-                    show_reasoning=False
+                    parameters=json.dumps({
+                        "tickers": params.tickers,
+                        "intervals": params.intervals,
+                        "strategies": params.strategies
+                    })
                 )
+                db.add(run_record)
+                db.commit()
+                db.refresh(run_record)
+
+                # Run backtest in thread pool to avoid blocking
+                def run_backtest_sync():
+                    backtester = Backtester(
+                        primary_interval=Interval.from_string(params.intervals[0]),
+                        intervals=[Interval.from_string(i) for i in params.intervals],
+                        tickers=params.tickers,
+                        start_date=params.start_date,
+                        end_date=params.end_date,
+                        initial_capital=params.initial_cash,
+                        strategies=params.strategies,
+                        model_name=current_settings.model.name,
+                        model_provider=current_settings.model.provider,
+                        model_base_url=current_settings.model.base_url,
+                        show_agent_graph=False,
+                        show_reasoning=False
+                    )
+                    
+                    updates = []
+                    for update in backtester.run_backtest_stream():
+                        updates.append(update)
+                    return updates, backtester
                 
-                strategy_df = strategy_backtester.get_portfolio_history_df()
-                if not strategy_df.empty:
-                    strategy_df = strategy_df[["Portfolio Value"]].rename(columns={"Portfolio Value": strategy})
-                    all_histories.append(strategy_df)
-            
-            # Merge all results
-            if all_histories:
-                combined_df = pd.concat(all_histories, axis=1).ffill().reset_index()
-                multi_model_history = combined_df.to_dict(orient='records')
-                await websocket.send_json({"type": "multi_model_history", "data": multi_model_history})
+                # Run in executor
+                updates, backtester = await loop.run_in_executor(None, run_backtest_sync)
+                
+                # Send all updates
+                final_metrics = None
+                portfolio_history = None
+                
+                for update in updates:
+                    await websocket.send_json(update)
+                    if update["type"] == "final_metrics":
+                        final_metrics = update["data"]
+                    elif update["type"] == "portfolio_history":
+                        portfolio_history = update["data"]
+                
+                # Update database
+                if portfolio_history and len(portfolio_history) > 0:
+                    final_value = portfolio_history[-1].get("Portfolio Value", params.initial_cash)
+                    run_record.final_portfolio_value = final_value
+                    run_record.total_return_pct = ((final_value / params.initial_cash) - 1) * 100
+                
+                if final_metrics:
+                    run_record.sharpe_ratio = final_metrics.get("sharpe_ratio")
+                    run_record.sortino_ratio = final_metrics.get("sortino_ratio")
+                    run_record.max_drawdown = final_metrics.get("max_drawdown")
+                
+                if portfolio_history:
+                    run_record.portfolio_history = json.dumps(portfolio_history)
+                
+                db.commit()
+
+                # Generate multi-model history
+                import pandas as pd
+                
+                if portfolio_history and len(portfolio_history) > 0:
+                    ensemble_df = pd.DataFrame(portfolio_history).set_index("Date")
+                    
+                    if len(params.strategies) > 1:
+                        ensemble_df = ensemble_df[["Portfolio Value"]].rename(columns={"Portfolio Value": "Ensemble"})
+                        all_histories = [ensemble_df]
+                        
+                        for strategy in params.strategies:
+                            await websocket.send_json({"type": "status", "message": f"Running {strategy}..."})
+                            
+                            def run_strategy_sync(strat):
+                                strategy_backtester = Backtester(
+                                    primary_interval=Interval.from_string(params.intervals[0]),
+                                    intervals=[Interval.from_string(i) for i in params.intervals],
+                                    tickers=params.tickers,
+                                    start_date=params.start_date,
+                                    end_date=params.end_date,
+                                    initial_capital=params.initial_cash,
+                                    strategies=[strat],
+                                    model_name=current_settings.model.name,
+                                    model_provider=current_settings.model.provider,
+                                    model_base_url=current_settings.model.base_url,
+                                    show_agent_graph=False,
+                                    show_reasoning=False
+                                )
+                                return strategy_backtester.get_portfolio_history_df()
+                            
+                            strategy_df = await loop.run_in_executor(None, run_strategy_sync, strategy)
+                            if not strategy_df.empty:
+                                strategy_df = strategy_df[["Portfolio Value"]].rename(columns={"Portfolio Value": strategy})
+                                all_histories.append(strategy_df)
+                        
+                        combined_df = pd.concat(all_histories, axis=1).ffill().reset_index()
+                        multi_model_history = combined_df.to_dict(orient='records')
+                    else:
+                        ensemble_df = ensemble_df[["Portfolio Value"]].rename(columns={"Portfolio Value": params.strategies[0]})
+                        multi_model_history = ensemble_df.reset_index().to_dict(orient='records')
+                    
+                    await websocket.send_json({"type": "multi_model_history", "data": multi_model_history})
+                
+                await websocket.send_json({"type": "complete", "run_id": run_record.id})
+
+            except Exception as e:
+                await websocket.send_json({"type": "error", "message": str(e)})
+            finally:
+                db.close()
         
-        await websocket.send_json({"type": "complete", "run_id": run_record.id})
+        # Run the backtest
+        await run_backtest_async()
 
     except WebSocketDisconnect:
         print("WebSocket disconnected")
     except Exception as e:
         await websocket.send_json({"type": "error", "message": str(e)})
     finally:
-        if db:
-            db.close()
         await websocket.close()
 
 @app.get("/api/backtests")
