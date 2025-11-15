@@ -533,6 +533,13 @@ class Backtester:
                 "Net Exposure": net_exposure
             })
 
+            # Yield analyst signals for visualization
+            yield {
+                "type": "analysis_details",
+                "data": analyst_signals,
+                "date": str(current_time)
+            }
+
             # Yield progress for each ticker
             for ticker in self.tickers:
                 pos = self.portfolio["positions"][ticker]
