@@ -566,6 +566,15 @@ class Backtester:
         yield {"type": "final_metrics", "data": performance_metrics}
 
         performance_df = self.analyze_performance()
+        if not performance_df.empty:
+            # Calculate drawdown
+            rolling_max = performance_df["Portfolio Value"].cummax()
+            drawdown = (performance_df["Portfolio Value"] - rolling_max) / rolling_max
+            performance_df["Drawdown"] = drawdown
+
+            # Calculate daily PnL
+            performance_df["Daily PnL"] = performance_df["Portfolio Value"].diff().fillna(0)
+
         portfolio_history = performance_df.reset_index().to_dict(orient='records')
         yield {"type": "portfolio_history", "data": portfolio_history}
 
@@ -713,3 +722,49 @@ class Backtester:
         print(f"Max Consecutive Losses: {Fore.RED}{max_consecutive_losses}{Style.RESET_ALL}")
 
         return performance_df
+
+    def get_portfolio_history_df(self) -> pd.DataFrame:
+        """
+        Runs the backtest simulation silently and returns only the portfolio history DataFrame.
+        Used for multi-strategy comparison without console output.
+        """
+        self.prefetch_data()
+
+        ticker = self.tickers[0]
+        data_df: pd.DataFrame = self.klines[ticker]
+        if data_df.empty:
+            return pd.DataFrame()
+
+        self.portfolio_values = [{"Date": data_df.loc[0, 'open_time'], "Portfolio Value": self.initial_capital}]
+
+        agent = Agent(
+            intervals=self.intervals,
+            strategies=self.strategies,
+            show_agent_graph=False,
+        )
+
+        for row in data_df.itertuples(index=True):
+            index = row.Index
+            current_time = row.close_time
+            current_prices = {t: self.klines[t].iloc[index]["close"] for t in self.tickers}
+            
+            output = agent.run(
+                primary_interval=self.primary_interval,
+                tickers=self.tickers,
+                end_date=current_time,
+                portfolio=self.portfolio,
+                model_name=self.model_name,
+                model_provider=self.model_provider,
+                model_base_url=self.model_base_url,
+                show_reasoning=False,
+            )
+            decisions = output.get("decisions")
+
+            for ticker in self.tickers:
+                decision = decisions.get(ticker, {"action": "hold", "quantity": 0.0})
+                self.execute_trade(ticker, decision.get("action", "hold"), decision.get("quantity", 0.0), current_prices[ticker])
+
+            total_value = self.calculate_portfolio_value(current_prices)
+            self.portfolio_values.append({"Date": current_time, "Portfolio Value": total_value})
+        
+        return pd.DataFrame(self.portfolio_values).set_index("Date")

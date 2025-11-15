@@ -120,6 +120,7 @@ async def websocket_backtest(websocket: WebSocket):
         db.commit()
         db.refresh(run_record)
 
+        # Run main ensemble backtest with streaming
         backtester = Backtester(
             primary_interval=Interval.from_string(params.intervals[0]),
             intervals=[Interval.from_string(i) for i in params.intervals],
@@ -160,6 +161,46 @@ async def websocket_backtest(websocket: WebSocket):
             run_record.portfolio_history = json.dumps(portfolio_history)
         
         db.commit()
+
+        # Run individual strategy backtests for comparison
+        if len(params.strategies) > 1:
+            import pandas as pd
+            all_histories = []
+            
+            # Add ensemble results
+            ensemble_df = pd.DataFrame(portfolio_history).set_index("Date")
+            ensemble_df = ensemble_df[["Portfolio Value"]].rename(columns={"Portfolio Value": "Ensemble"})
+            all_histories.append(ensemble_df)
+            
+            # Run each strategy individually
+            for strategy in params.strategies:
+                await websocket.send_json({"type": "status", "message": f"Running {strategy}..."})
+                
+                strategy_backtester = Backtester(
+                    primary_interval=Interval.from_string(params.intervals[0]),
+                    intervals=[Interval.from_string(i) for i in params.intervals],
+                    tickers=params.tickers,
+                    start_date=params.start_date,
+                    end_date=params.end_date,
+                    initial_capital=params.initial_cash,
+                    strategies=[strategy],
+                    model_name=current_settings.model.name,
+                    model_provider=current_settings.model.provider,
+                    model_base_url=current_settings.model.base_url,
+                    show_agent_graph=False,
+                    show_reasoning=False
+                )
+                
+                strategy_df = strategy_backtester.get_portfolio_history_df()
+                if not strategy_df.empty:
+                    strategy_df = strategy_df[["Portfolio Value"]].rename(columns={"Portfolio Value": strategy})
+                    all_histories.append(strategy_df)
+            
+            # Merge all results
+            if all_histories:
+                combined_df = pd.concat(all_histories, axis=1).ffill().reset_index()
+                multi_model_history = combined_df.to_dict(orient='records')
+                await websocket.send_json({"type": "multi_model_history", "data": multi_model_history})
         
         await websocket.send_json({"type": "complete", "run_id": run_record.id})
 
